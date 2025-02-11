@@ -1,6 +1,8 @@
 import streamlit as st
 import os
 import json
+import concurrent.futures
+import re
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain.output_parsers.openai_tools import JsonOutputToolsParser
@@ -38,126 +40,122 @@ topic = st.text_input("Enter a topic to fetch news & research articles", "Large 
 
 if st.button("Fetch & Summarize"):
     with st.spinner("Fetching articles..."):
+        num_cores = os.cpu_count()
 
-        # Fetch news articles
+        # max_workers = min(4, num_cores // 2)
+        max_workers = 3
+
+        start = time.time()
+
+        topic = "Large language Models"
         q = QueryArticlesIter(
             lang="eng",
             categoryUri=QueryItems.OR(["news/Technology", "events/Technology"]),
             keywords=QueryItems.OR([topic]),
             ignoreKeywords=QueryItems.OR(["NASDAQ", "Stock", "Market", "Investment"]),
         )
-        
-        news_data_all = []
-        for pap in q.execQuery(er, sortBy="date", maxItems=10):
-            pap_dict = {
+
+        def fetch_news_article(pap):
+            return {
                 'type': 'NEWS',
                 'title': pap.get('title'),
                 'date': pap.get('date'),
-                'authors': [author.get('name') for author in (pap.get('authors') or []) if author.get('name')],
+                'authors': [a.get('name') for a in (pap.get('authors') or []) if a.get('name')],
                 'body': pap.get('body'),
                 'url': pap.get('url'),
                 'source': pap.get('source'),
             }
-            news_data_all.append(pap_dict)
 
-        title_names = '\n'.join([f"{i+1}. " + item['title'] for i, item in enumerate(news_data_all)])
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            news_data = list(executor.map(fetch_news_article, q.execQuery(er, sortBy="date", maxItems=5)))
 
-        # Title Filtering with AI
-        class TitleFilter(BaseModel):
-            items: List[str] = Field(description="List of relevant titles")
 
-        model = ChatOpenAI(model="gpt-4o-mini").bind_tools([TitleFilter])
-
-        system_prompt = "You are an AI trained to filter relevant news articles."
-        user_prompt = """
-        You need to filter out at least reasonably relevant news article titles related to the topic.
-        The topic is: {topic}
-        Titles:
-        {titles}
-
-        Give output as JSON containing the list of exact titles.
-        """
-
-        prompt_template = ChatPromptTemplate.from_messages(
-            [("system", system_prompt), ("user", user_prompt)]
-        )
-        str_parser = JsonOutputToolsParser()
-
-        chain = prompt_template | model | str_parser
-        output = chain.invoke({'topic': topic, 'titles': title_names})
-        output = [i['args'] for i in output]
-
-        # Filtering News Data
-        news_data = [j for j in news_data_all if j['title'] in output[0]['items']]
-
-        # Fetch Research Papers using Metaphor API
-        def get_metaphor_articles(query, num_results=5):
+        def get_metaphor_articles(query, num_results=10, include_domains=['www.sciencedirect.com']):
+            """Fetch articles using the Metaphor API and extract PII identifiers."""
             try:
-                response = metaphor_client.search(query, num_results=num_results, include_domains=['www.sciencedirect.com'])
-                articles = [{"url": result.url} for result in response.results]
-                return articles
+                response = metaphor_client.search(query, num_results=num_results, include_domains=include_domains)
+                
+                pattern = re.compile(r'pii/(.*?)$')
+                return [match.group(1) for result in response.results 
+                        if (match := pattern.search(result.url))]
             except Exception as e:
+                print(f"Error fetching Metaphor articles: {e}")
                 return []
 
-        metaphor_articles = get_metaphor_articles(topic)
-        research_data = []
-        for article in metaphor_articles:
-            url = article["url"]
-            pii = url.split("pii/")[-1] if "pii/" in url else None
-            if pii:
+        def fetch_research_paper(pii):
+            """Fetch research paper metadata from Elsevier API using PII."""
+            try:
                 pii_doc = FullDoc(sd_pii=pii)
                 if pii_doc.read(els_client):
-                    temp_dict = {
-                        'type': 'RESEARCH PAPER',
-                        'title': pii_doc.data['coredata']['dc:title'],
-                        'date': pii_doc.data['coredata']['prism:coverDate'],
-                        'body': pii_doc.data['coredata']['dc:description'],
-                        'url': [i.get('@href') for i in pii_doc.data['coredata']['link'] if i.get('@rel') != 'self'],
-                        'publication': pii_doc.data['coredata']['prism:publicationName'],
+                    core_data = pii_doc.data['coredata']
+                    authors = []
+
+                    if isinstance(core_data.get('dc:creator'), list):  
+                        authors = [author.get('$') for author in core_data['dc:creator'] if author.get('$')]
+                    elif isinstance(core_data.get('dc:creator'), dict):  
+                        authors = [core_data['dc:creator'].get('$')]
+
+                    return {
+                        'type': 'Research Paper',
+                        'title': core_data.get('dc:title', 'Unknown Title'),
+                        'date': core_data.get('prism:coverDate', 'Unknown Date'),
+                        'authors': authors,
+                        'body': core_data.get('dc:description', 'No Description'),
+                        'url': [link.get('@href') for link in core_data.get('link', []) if link.get('@rel') != 'self'],
+                        'publication': core_data.get('prism:publicationName', 'Unknown Publication'),
                     }
-                    if isinstance(pii_doc.data['coredata']['dc:creator'], list):
-                        temp_dict['authors'] = [i.get('$') for i in pii_doc.data['coredata']['dc:creator'] if i.get('$')]
-                    else:
-                        temp_dict['authors'] = pii_doc.data['coredata']['dc:creator'].get('$') if pii_doc.data['coredata']['dc:creator'] else None
+            except Exception as e:
+                print(f"Error fetching research paper for PII {pii}: {e}")
+                return None
 
+        output = get_metaphor_articles(topic, 7)
 
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            research_data = list(filter(None, executor.map(fetch_research_paper, output))) 
 
-                    research_data.append(temp_dict)
+        full_length_data = research_data + news_data
 
-        # Summarization
-        class SummaryOutput(BaseModel):
-            title: str = Field(description="Title of the summary")
-            summary: str = Field(description="Summarized content")
+        def summarize_article(article):
+            title = article.get('title')
+            text = article.get('body')  
+            if not text: 
+                return None
+            
+            class TitleFilter(BaseModel):
+                title: str = Field(description = "Title of the summary")
+                summary: str = Field(description="Summary of the given data")
 
-        model = ChatOpenAI(model="gpt-4o-mini").bind_tools([SummaryOutput])
+            model = ChatOpenAI(model="gpt-4o-mini").bind_tools([TitleFilter])
 
-        system_prompt = "You are an AI trained to summarize articles."
-        user_prompt = """
-        Summarize the following article into at most 4 sentences while keeping the topic in mind.
-        The topic is: {topic}
-        Title: {title}
-        Text: {text}
-        
-        Provide output as JSON with title and summary.
-        """
+            system_prompt = "You are an AI system trained on sumarization"
+            user_prompt = """
+            You are required to summazrize the given data into not more than 4 sentances. The sumary must be created by keeping
+            the topic in mind as these articles are fetched with respect to the topic.
+            The output must feel natural and should not feel the text was summarized.
+            The topic name is {topic}
+            title: 
+            {title}
 
-        prompt_template = ChatPromptTemplate.from_messages(
-            [("system", system_prompt), ("user", user_prompt)]
-        )
-        str_parser = JsonOutputToolsParser()
+            text:
+            {text}
 
-        chain = prompt_template | model | str_parser
+            Give the output as JSON containing the title and summary.
+            """
+            prompt_template = ChatPromptTemplate.from_messages(
+                [("system", system_prompt), ("user", user_prompt)]
+            )
+            str_parser = JsonOutputToolsParser()
 
-        full_length_data = news_data + research_data
-        summary_list = []
+            chain = prompt_template | model | str_parser
 
-        for item in full_length_data:
-            title = item.get('title')
-            text = item.get('body')
             output = chain.invoke({'topic': topic, 'title': title, 'text': text})
-            item['body'] = output[0]['args']['summary']
-            summary_list.append(item)
+            article['body'] = output[0]['args']['summary']
+            return article
 
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            results = list(executor.map(summarize_article, full_length_data))
+
+        summary_list = [res for res in results if res is not None]
     # Display Results in Streamlit
     st.subheader("📢 Summarized Articles")
     for article in summary_list:
