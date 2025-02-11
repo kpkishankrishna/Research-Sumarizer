@@ -1,0 +1,9 @@
+streamlit
+openai
+langchain
+langchain_openai
+pydantic
+metaphor-python
+elsapy
+eventregistry
+requests
